@@ -136,7 +136,7 @@ def after_tbi_sanity_checks(
             if not param.requires_grad:
                 continue
 
-            if param.is_tied:
+            if getattr(param, "is_tied", False):
                 tied_info = param.get_tied_info()
                 name = tied_info.get_full_name_from_module_id_to_prefix(
                     module_id_to_prefix=unwrapped_model.module_id_to_prefix
@@ -194,7 +194,7 @@ def before_optim_step_sanity_checks(
             if not param.requires_grad:
                 continue
 
-            if param.is_tied:
+            if getattr(param, "is_tied", False):
                 tied_info = param.get_tied_info()
                 name = tied_info.get_full_name_from_module_id_to_prefix(
                     module_id_to_prefix=unwrapped_model.module_id_to_prefix

@@ -25,7 +25,7 @@ from nanotron.serialize.optimizer import (
     save_lr_scheduler,
     save_optimizer,
 )
-from nanotron.serialize.weights import save_weights
+from nanotron.serialize.weights import save_weights, _is_fsdp_model
 
 """
 We're going to use safetensors. The reason is that loading segments is going to be much easier
@@ -123,7 +123,9 @@ def save(
     # TODO @thomas21: sanity check, not sure whether that needs to happen at testing or now (depends how much it costs)
     ###
     # SANITY CHECK: Check that the model params are synchronized across `parallel_context.dp_cp_pg`
-    if sanity_checks:
+    # NOTE: FSDP2 models use DTensors which are not compatible with these NanotronParameter-based checks.
+    # FSDP2 handles parameter synchronization internally.
+    if sanity_checks and not _is_fsdp_model(model):
         for name, param_or_buffer in sorted(model.state_dict().items(), key=lambda x: x[0]):
             assert_tensor_synced_across_pg(
                 tensor=param_or_buffer,

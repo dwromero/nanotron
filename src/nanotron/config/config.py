@@ -15,7 +15,7 @@ from yaml.loader import SafeLoader
 
 from nanotron.config.lighteval_config import LightEvalConfig
 from nanotron.config.models_config import ExistingCheckpointInit, NanotronConfigs, RandomInit, SpectralMupInit
-from nanotron.config.parallelism_config import ParallelismArgs
+from nanotron.config.parallelism_config import DataParallelEngine, ParallelismArgs
 from nanotron.config.utils_config import (
     InitScalingMethod,
     RecomputeGranularity,
@@ -638,6 +638,7 @@ def get_config_from_dict(
                 torch.dtype: cast_str_to_torch_dtype,
                 PipelineEngine: cast_str_to_pipeline_engine,
                 TensorParallelLinearMode: lambda x: TensorParallelLinearMode[x.upper()],
+                DataParallelEngine: lambda x: DataParallelEngine(x.lower()),
                 RecomputeGranularity: lambda x: RecomputeGranularity[x.upper()],
                 InitScalingMethod: lambda x: InitScalingMethod[x.upper()],
                 SamplerType: lambda x: SamplerType[x.upper()],

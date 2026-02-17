@@ -266,6 +266,9 @@ def warn_once(
 
 
 def human_format(num: float, billions: bool = False, divide_by_1024: bool = False) -> str:
+    # High-precision mode for validation (set NANOTRON_LOG_PRECISION=high)
+    if os.environ.get("NANOTRON_LOG_PRECISION") == "high":
+        return f"{num:.8g}"
     if abs(num) < 1:
         return "{:.3g}".format(num)
     SIZES = ["", "K", "M", "B", "T", "P", "E"]

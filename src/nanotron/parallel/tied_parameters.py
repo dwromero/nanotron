@@ -113,7 +113,7 @@ def get_tied_id_to_param(
             param.get_tied_info().global_ranks,  # TODO @nouamane: merge groups which tie the same parameter
         ): param
         for param in parameters
-        if param.is_tied
+        if getattr(param, "is_tied", False)
     }
 
 

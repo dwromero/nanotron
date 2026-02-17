@@ -10,6 +10,7 @@ from nanotron import logging
 from nanotron.distributed import ProcessGroup
 from nanotron.logging import log_rank
 from nanotron.optim.gradient_accumulator import GradientAccumulator
+from nanotron.parallel.data_parallel.fsdp import fsdp_enable_sync, fsdp_no_sync, is_fsdp_model
 from nanotron.parallel.data_parallel.utils import ddp_trigger_sync_in_bwd
 from nanotron.parallel.pipeline_parallel.context_manager import attach_pipeline_state_to_model
 from nanotron.parallel.pipeline_parallel.state import PipelineTrainBatchState
@@ -63,7 +64,8 @@ class PipelineEngine(ABC):
     @staticmethod
     def _get_fwd_context(model: torch_nn.Module):
         is_ddp = isinstance(model, DistributedDataParallel)
-        # We never to trigger a DDP sync in the next backward pass
+        # We never trigger a DDP sync in the next backward pass
+        # FSDP2 doesn't need special context for forward; sync is controlled in backward
         context = ContextManagers([model.no_sync()] if is_ddp else [])
         return context
 
@@ -107,6 +109,7 @@ class PipelineEngine(ABC):
             self.nb_microbatches is not None
         ), "You must call `train_batch_iter` first and set `self.nb_microbatches`"
         is_ddp = isinstance(model, DistributedDataParallel)
+        _is_fsdp = is_fsdp_model(model)
         context_list = []
         if is_ddp:
             if grad_accumulator is not None and nb_backwards < self.nb_microbatches - 1:
@@ -114,6 +117,13 @@ class PipelineEngine(ABC):
             if nb_backwards == self.nb_microbatches - 1:
                 # Triggers DDP to sync gradients in the next backward pass
                 context_list.append(ddp_trigger_sync_in_bwd(model_ddp=model))
+        elif _is_fsdp:
+            if nb_backwards < self.nb_microbatches - 1:
+                # Skip gradient sync during accumulation (not last microbatch)
+                context_list.append(fsdp_no_sync(model))
+            else:
+                # Last microbatch: enable gradient sync
+                context_list.append(fsdp_enable_sync(model))
         context = ContextManagers(context_list)
         return context
 

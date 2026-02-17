@@ -67,6 +67,13 @@ from nanotron.models.qwen import Qwen2ForTraining
 from nanotron.models.starcoder2 import Starcoder2ForTraining
 from nanotron.optim.clip_grads import clip_grad_norm
 from nanotron.parallel import ParallelContext
+from nanotron.parallel.data_parallel.fsdp import (
+    apply_fsdp2,
+    collect_tied_param_metadata,
+    is_fsdp_model,
+    sync_fsdp_tied_gradients,
+    FSDPTiedParamMetadata,
+)
 from nanotron.parallel.data_parallel.utils import sync_gradients_across_dp
 from nanotron.parallel.parameters import NanotronParameter, sanity_check
 from nanotron.parallel.pipeline_parallel.engine import (
@@ -194,9 +201,7 @@ class DistributedTrainer:
             parallel_config=self.config.parallelism, tp_pg=self.parallel_context.tp_pg
         )
         self.model = self.init_model()  # Defines self.model
-        self.unwrapped_model: NanotronModel = (
-            self.model.module if isinstance(self.model, DistributedDataParallel) else self.model
-        )
+        self.unwrapped_model: NanotronModel = self._get_unwrapped_model(self.model)
 
         # TODO: find a better way to handle this
         parametrization_method = (
@@ -211,6 +216,7 @@ class DistributedTrainer:
             model=self.model,
             optimizer_args=self.config.optimizer,
             parallel_context=self.parallel_context,
+            parallel_config=self.config.parallelism,
         )
         if self.init_checkpoint_path is not None and self.config.checkpoints.load_optimizer:
             load_optimizer(
@@ -294,6 +300,14 @@ class DistributedTrainer:
 
         # Initialize metrics logger
         self.metrics_logging = MetricsLogger(self.config)
+
+    @staticmethod
+    def _get_unwrapped_model(model) -> NanotronModel:
+        """Get the underlying NanotronModel, unwrapping DDP if needed.
+        FSDP2 modifies the model in-place (no wrapper class), so it stays as-is."""
+        if isinstance(model, DistributedDataParallel):
+            return model.module
+        return model
 
     def pre_init(self):
         self.init_checkpoint_path = parse_ckpt_path(config=self.config, parallel_context=self.parallel_context)
@@ -532,7 +546,7 @@ class DistributedTrainer:
 
         # TODO @nouamanetazi: refactor this
         # Useful mapping
-        self.unwrapped_model = self.model.module if isinstance(self.model, DistributedDataParallel) else self.model
+        self.unwrapped_model = self._get_unwrapped_model(self.model)
         self.unwrapped_model.module_id_to_prefix = {
             id(module): f"{module_name}." for module_name, module in self.unwrapped_model.named_modules()
         }
@@ -627,7 +641,10 @@ class DistributedTrainer:
 
         after_tbi_sanity_checks(self.config, self.parallel_context, self.unwrapped_model, self.grad_accumulator)
 
-        if isinstance(self.model, DistributedDataParallel) and self.grad_accumulator is not None:
+        _model_is_ddp = isinstance(self.model, DistributedDataParallel)
+        _model_is_fsdp = is_fsdp_model(self.model)
+
+        if _model_is_ddp and self.grad_accumulator is not None:
             # Wait for fp32 grads allreduce to finish to make sure grads are synced across DP
             assert (
                 self.grad_accumulator.fp32_grads_allreduce_handle is not None
@@ -639,26 +656,35 @@ class DistributedTrainer:
                 self.grad_accumulator.fp32_grads_allreduce_handle.wait()
 
         nanotron_timer("sync_gradients", "cuda").start()
-        # Sync tied weights
-        if not isinstance(self.model, DistributedDataParallel):
+
+        if _model_is_fsdp:
+            # FSDP2 handles DP gradient sync automatically during backward.
+            # But tied param gradients across TP/PP still need explicit sync.
+            if self._fsdp_tied_metadata is not None:
+                sync_fsdp_tied_gradients(
+                    model=self.model,
+                    metadata=self._fsdp_tied_metadata,
+                    parallel_context=self.parallel_context,
+                )
+        elif not _model_is_ddp:
+            # No DDP and no FSDP: manually sync across DP
             if self.parallel_context.context_parallel_size > 1:
                 raise NotImplementedError("Context parallel size > 1 is not supported yet without DDP")
-            # Manually sync across DP if it's not handled by DDP
             sync_gradients_across_dp(
                 module=self.model,
                 dp_pg=self.parallel_context.dp_pg,
                 reduce_op=dist.ReduceOp.AVG,
-                # TODO @thomasw21: This is too memory hungry, instead we run all_reduce
-                reduce_scatter=False,  # optimizer.inherit_from(ZeroDistributedOptimizer),
+                reduce_scatter=False,
                 grad_accumulator=self.grad_accumulator,
             )
 
-        # TODO @nouamane: Put this in hooks so we can overlap communication with gradient computation on the last backward pass.
-        sync_tied_weights_gradients(
-            module=self.unwrapped_model,
-            parallel_context=self.parallel_context,
-            grad_accumulator=self.grad_accumulator,
-        )
+        if not _model_is_fsdp:
+            # For DDP / no-DDP: use NanotronParameter metadata directly
+            sync_tied_weights_gradients(
+                module=self.unwrapped_model,
+                parallel_context=self.parallel_context,
+                grad_accumulator=self.grad_accumulator,
+            )
         nanotron_timer("sync_gradients", "cuda").end()
 
         # Clip gradients
@@ -675,6 +701,8 @@ class DistributedTrainer:
                 named_parameters=named_parameters,
                 grad_accumulator=self.grad_accumulator,
                 max_norm=self.config.optimizer.clip_grad,
+                dp_pg=self.parallel_context.dp_pg if _model_is_fsdp else None,
+                fsdp_tied_metadata=self._fsdp_tied_metadata if _model_is_fsdp else None,
             )
         nanotron_timer("clip_gradients", "cuda").end()
 
@@ -778,7 +806,7 @@ class DistributedTrainer:
                 "tokens_per_sec_per_gpu", tokens_per_sec / self.parallel_context.world_pg.size(), "human_format"
             ),  # , "1.6E"),
             LogItem("global_batch_size", self.config.global_batch_size_in_tokens, "human_format"),  # , "5d"),
-            LogItem("lm_loss", loss_avg.item(), "human_format"),  # , "1.6E"),
+            LogItem("lm_loss", loss_avg.item() if loss_avg is not None else 0.0, "human_format"),  # , "1.6E"),
             LogItem("lr", lr, "human_format"),  # , ".3E"),
             LogItem("model_tflops_per_gpu", model_tflops, "human_format"),  # , ".2f"),
             # LogItem("hardware_tflops_per_gpu", hardware_tflops, "human_format"),  # , ".2f"),
@@ -1011,6 +1039,7 @@ class DistributedTrainer:
                 )
         model = self._init_model_instance()
         model = self._load_model_checkpoint(model)
+        model = self._apply_data_parallelism(model)
         return model
 
     def _init_model_instance(self) -> NanotronModel:
@@ -1030,7 +1059,7 @@ class DistributedTrainer:
         return model
 
     def _load_model_checkpoint(self, model: NanotronModel) -> NanotronModel:
-        unwrapped_model = model.module if isinstance(model, DistributedDataParallel) else model
+        unwrapped_model = self._get_unwrapped_model(model)
 
         # Load or initialize model weights
         reloaded_from_checkpoint = False
@@ -1081,6 +1110,45 @@ class DistributedTrainer:
 
         return model
 
+    def _apply_data_parallelism(self, model: NanotronModel) -> NanotronModel:
+        """Apply FSDP2 wrapping after weight init/loading.
+
+        FSDP2 converts parameters to DTensors in-place, so it must be applied
+        after all NanotronParameter-aware operations (random init, checkpoint
+        loading, tied-parameter sync) have completed.
+
+        Before wrapping, we collect tied parameter metadata (needed for gradient
+        norm computation and gradient sync with TP) since this info is lost
+        when NanotronParameters become DTensors.
+        """
+        parallel_config = self.config.parallelism
+        if parallel_config is not None and parallel_config.is_fsdp:
+            if self.parallel_context.context_parallel_size > 1:
+                raise NotImplementedError(
+                    "FSDP2 + Context Parallelism (CP > 1) is not yet supported. "
+                    "FSDP2 shards across dp_pg, but CP requires gradient sync across dp_cp_pg. "
+                    "Use DDP instead, or set context_parallel_size=1."
+                )
+
+            # Collect tied param metadata BEFORE FSDP wrapping destroys NanotronParameter info
+            self._fsdp_tied_metadata = collect_tied_param_metadata(
+                model=model,
+                parallel_context=self.parallel_context,
+            )
+            # Store metadata on the model as well for external access
+            model._fsdp_tied_metadata = self._fsdp_tied_metadata
+
+            model = apply_fsdp2(
+                model=model,
+                parallel_context=self.parallel_context,
+                reshard_after_forward=parallel_config.fsdp_reshard_after_forward,
+                hybrid=parallel_config.fsdp_hybrid,
+                dtype=self.config.model.dtype,
+            )
+        else:
+            self._fsdp_tied_metadata = None
+        return model
+
     def _init_model(
         self,
         model_builder: Callable[[], NanotronModel],
@@ -1090,7 +1158,10 @@ class DistributedTrainer:
         parallel_context = self.parallel_context
 
         parallel_config = config.parallelism
-        make_ddp = parallel_context.data_parallel_size > 1 or parallel_context.context_parallel_size > 1 and not (
+        use_fsdp = parallel_config is not None and parallel_config.is_fsdp
+        make_ddp = not use_fsdp and (
+            parallel_context.data_parallel_size > 1 or parallel_context.context_parallel_size > 1
+        ) and not (
             config.optimizer.accumulate_grad_in_fp32 and config.optimizer.zero_stage > 0
         )
 
@@ -1148,20 +1219,23 @@ class DistributedTrainer:
             rank=0,
         )
 
-        # Model make it DDP
-        if make_ddp is True:
-            # Check that the model has at least one grad. Necessary for DDP
+        # Sanity check the model BEFORE wrapping with DDP/FSDP
+        # (FSDP2 converts NanotronParameter to DTensor, so check must happen first)
+        sanity_check(root_module=model)
+
+        if use_fsdp:
+            # FSDP2 wrapping is deferred until after weight init/loading
+            # (see init_model -> _apply_data_parallelism)
             check_model_has_grad(model=model, parallel_context=parallel_context)
-            # TODO @thomasw21: DDP doesn't support broadcasting complex buffers (and we don't really need that broadcasting anyway)
+        elif make_ddp is True:
+            # DDP path (original)
+            check_model_has_grad(model=model, parallel_context=parallel_context)
             model = DistributedDataParallel(
                 model,
                 process_group=parallel_context.dp_cp_pg,
                 broadcast_buffers=False,
                 bucket_cap_mb=config.model.ddp_bucket_cap_mb,
             )
-
-        # Sanity check the model, all parameters must be NanotronParameter (either tied or sharded)
-        sanity_check(root_module=model)
 
         return model
 
@@ -1260,15 +1334,18 @@ class DistributedTrainer:
         self.config.general.step = self.metadata.last_train_step
         self.config.general.consumed_train_samples = self.metadata.consumed_train_samples # TODO: idc abt this
 
+        _use_fsdp = is_fsdp_model(self.model)
         save(
             model=self.unwrapped_model,
             optimizer=self.optimizer,
             lr_scheduler=self.lr_scheduler,
-            should_save_model=bool(
+            # FSDP2: dcp.save is collective — all ranks must participate
+            should_save_model=True if _use_fsdp else bool(
                 dist.get_rank(self.parallel_context.dp_cp_pg) == 0
-            ),  # We only save the weights on DP_CP==0
-            should_save_optimizer=True,
-            should_save_lr_scheduler=True,
+            ),
+            # FSDP2: skip nanotron optimizer save (uses standard optimizer, not ZeRO)
+            should_save_optimizer=not _use_fsdp,
+            should_save_lr_scheduler=not _use_fsdp,
             should_save_config=bool(
                 dist.get_rank(self.parallel_context.world_pg) == 0
             ),  # We only save the config on world_rank==0

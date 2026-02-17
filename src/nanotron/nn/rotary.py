@@ -158,14 +158,22 @@ class FlashRotaryEmbedding(OrigFlashRotaryEmbedding):
         device=None,
         seq_len_interpolation_factor=None,
     ):
-        super().__init__(
-            dim,
-            base,
-            interleaved,
-            scale_base,
-            pos_idx_in_fp32,
-            device,
-        )
+        # Use kwargs to be compatible with different flash_attn versions
+        init_kwargs = dict(dim=dim, base=base, interleaved=interleaved)
+        import inspect
+        sig = inspect.signature(OrigFlashRotaryEmbedding.__init__)
+        if "scale_base" in sig.parameters:
+            init_kwargs["scale_base"] = scale_base
+        if "pos_idx_in_fp32" in sig.parameters:
+            init_kwargs["pos_idx_in_fp32"] = pos_idx_in_fp32
+        if "device" in sig.parameters:
+            init_kwargs["device"] = device
+        super().__init__(**init_kwargs)
+        # Ensure attributes exist even if parent version doesn't set them
+        if not hasattr(self, "pos_idx_in_fp32"):
+            self.pos_idx_in_fp32 = pos_idx_in_fp32
+        if not hasattr(self, "scale_base"):
+            self.scale_base = scale_base
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
 
     def _update_cos_sin_cache(self, seqlen, device=None, dtype=None):

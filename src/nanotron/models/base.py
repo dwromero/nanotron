@@ -46,7 +46,7 @@ class NanotronModel(nn.Module, LoggingCollectorMixin, metaclass=ABCMeta):
 
         def params_gen():
             for name, param in self.named_parameters():
-                if param.is_tied:
+                if getattr(param, "is_tied", False):
                     yield (
                         param.get_tied_info().get_full_name_from_module_id_to_prefix(
                             module_id_to_prefix=self.module_id_to_prefix

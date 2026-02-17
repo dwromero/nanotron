@@ -27,7 +27,42 @@ from nanotron.serialize.utils import (
 logger = logging.get_logger(__name__)
 
 
+def _is_fsdp_model(model: nn.Module) -> bool:
+    """Check if the model is wrapped with FSDP2."""
+    return getattr(model, "_nanotron_fsdp", False)
+
+
+def _save_weights_fsdp(model: nn.Module, parallel_context: ParallelContext, root_folder: Path):
+    """Save weights for an FSDP2-wrapped model using PyTorch distributed checkpoint.
+
+    FSDP2 converts NanotronParameter to DTensor, so we use
+    torch.distributed.checkpoint.save() which handles DTensors natively.
+    All ranks must participate in this call.
+    """
+    try:
+        import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+    except ImportError:
+        log_rank(
+            "[FSDP2] torch.distributed.checkpoint not available, skipping checkpoint save.",
+            logger=logger, level=logging.WARNING, rank=0,
+        )
+        return
+
+    state_dict = get_model_state_dict(model, options=StateDictOptions(full_state_dict=False))
+    dcp.save(state_dict, storage_writer=dcp.FileSystemWriter(str(root_folder)))
+    log_rank(
+        f"[FSDP2] Saved sharded checkpoint to {root_folder}",
+        logger=logger, level=logging.INFO, rank=0,
+    )
+
+
 def save_weights(model: nn.Module, parallel_context: ParallelContext, root_folder: Path):
+    # FSDP2 models use distributed checkpoint (DTensors are not NanotronParameter)
+    if _is_fsdp_model(model):
+        _save_weights_fsdp(model, parallel_context, root_folder)
+        return
+
     root_folder = root_folder / "model"
 
     # We save only `dist.get_rank(parallel_context.dp_cp_pg) == 0`

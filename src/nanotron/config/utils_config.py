@@ -50,6 +50,8 @@ def serialize(data) -> dict:
             result[field.name] = value.name
         elif isinstance(value, SamplerType):
             result[field.name] = value.name
+        elif isinstance(value, Enum):
+            result[field.name] = value.value
         elif isinstance(value, torch.dtype):
             result[field.name] = dtype_to_str[value]
         elif isinstance(value, (list, tuple)):

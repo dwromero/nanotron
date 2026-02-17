@@ -20,6 +20,7 @@ from torch.profiler import ProfilerActivity, profile, tensorboard_trace_handler
 from nanotron import distributed as dist
 from nanotron import logging
 from nanotron.config import Config, DatasetStageArgs, LRSchedulerArgs, OptimizerArgs, ParallelismArgs
+from nanotron.parallel.data_parallel.fsdp import is_fsdp_model
 from nanotron.distributed import ProcessGroup
 from nanotron.logging import LogItem, human_format, log_rank
 from nanotron.models.base import NanotronModel
@@ -207,7 +208,8 @@ def get_custom_weight_decay_for_named_parameters(
     counter_excluded_params = 0
     for name, param in named_parameters:
         # Handle tied parameters: we exclude all tied parameters if one of them is in the exclude list
-        if param.is_tied:
+        tied_name = name
+        if getattr(param, "is_tied", False):
             tied_name = param.get_tied_info().get_full_name_from_module_id_to_prefix(
                 module_id_to_prefix=module_id_to_prefix
             )
@@ -317,6 +319,7 @@ def init_optimizer_and_grad_accumulator(
     model: Union[nn.Module, DistributedDataParallel],
     optimizer_args: OptimizerArgs,
     parallel_context: ParallelContext,
+    parallel_config: Optional[ParallelismArgs] = None,
 ) -> Tuple[BaseOptimizer, GradientAccumulator]:
     log_rank(
         "Building Optimizer and Gradient Accumulator and Learning Rate Scheduler",
@@ -325,7 +328,10 @@ def init_optimizer_and_grad_accumulator(
         rank=0,
         is_separator=True,
     )  # noqa
-    # Unwrap DDP
+
+    _use_fsdp = parallel_config is not None and parallel_config.is_fsdp
+
+    # Unwrap DDP (FSDP2 doesn't wrap, so model stays as-is)
     unwrapped_model: NanotronModel = model.module if isinstance(model, DistributedDataParallel) else model
 
     module_id_to_prefix = {id(module): f"{module_name}." for module_name, module in unwrapped_model.named_modules()}
@@ -363,7 +369,7 @@ def init_optimizer_and_grad_accumulator(
                     weight_decay=optimizer_args.weight_decay,
                     eps=optimizer_args.optimizer_factory.adam_eps,
                     betas=(optimizer_args.optimizer_factory.adam_beta1, optimizer_args.optimizer_factory.adam_beta2),
-                    fused=optimizer_args.optimizer_factory.torch_adam_is_fused,
+                    fused=not _use_fsdp and optimizer_args.optimizer_factory.torch_adam_is_fused,
                 )
 
         elif optimizer_args.optimizer_factory.name == "sgd":
@@ -386,8 +392,10 @@ def init_optimizer_and_grad_accumulator(
     optimizer_builder = basic_optimizer_builder
 
     # Gradient accumulator builder
+    # NOTE: FP32 gradient accumulation is not compatible with FSDP2 (which manages its own
+    # gradient lifecycle via reduce-scatter). Skip it when FSDP is active.
     grad_accumulator: Optional[GradientAccumulator] = None
-    if optimizer_args.accumulate_grad_in_fp32:
+    if optimizer_args.accumulate_grad_in_fp32 and not _use_fsdp:
 
         def grad_optimizer_builder(named_param_groups):
             result = OptimizerFromGradientAccumulator(
@@ -406,8 +414,16 @@ def init_optimizer_and_grad_accumulator(
 
         optimizer_builder = grad_optimizer_builder
 
-    if optimizer_args.zero_stage > 0:
-        # Build optimizer
+    if _use_fsdp:
+        # FSDP2 handles parameter/gradient/optimizer-state sharding automatically.
+        # Use a standard optimizer (no ZeRO) — FSDP provides ZeRO-3 equivalent.
+        log_rank(
+            "[FSDP2] Using standard optimizer (FSDP handles sharding, ZeRO not needed)",
+            logger=logger, level=logging.INFO, rank=0,
+        )
+        optimizer = optimizer_builder(named_param_groups)
+    elif optimizer_args.zero_stage > 0:
+        # Build optimizer with ZeRO-1 sharding
         optimizer = ZeroDistributedOptimizer(
             named_params_or_groups=named_param_groups,
             optimizer_builder=optimizer_builder,
@@ -440,7 +456,7 @@ def init_optimizer_and_grad_accumulator(
             param_name_to_offsets=param_name_to_dp_rank_offsets,
         )
 
-    # Register DDP hook to make fp32 grad accumulation work
+    # Register DDP hook to make fp32 grad accumulation work (DDP only, not FSDP)
     if isinstance(model, DistributedDataParallel) and grad_accumulator is not None:
         assert isinstance(grad_accumulator, FP32GradientAccumulator)
         model.register_comm_hook(
