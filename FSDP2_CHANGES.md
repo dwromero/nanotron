@@ -11,6 +11,7 @@ The implementation supports:
 - **Hybrid sharding (HSDP)**: shard within node, replicate across nodes (2D mesh)
 - **`reshard_after_forward`**: configurable — `true` (ZeRO-3) or `false` (ZeRO-2-like)
 - **Composition with Tensor Parallelism (TP)**: builds 2D DeviceMesh `(dp, tp)` for correct collective operations
+- **TP + HSDP**: combines Tensor Parallelism with Hybrid Sharding via 3D DeviceMesh `(replicate, shard, tp)`
 
 ## Validation
 
@@ -22,17 +23,19 @@ The implementation supports:
 | DDP vs FSDP2_HYBRID     | 0.0015%           | 0.0138%                |
 | DDP vs FSDP2_NORESHARD  | 0.0016%           | 0.0221%                |
 
-### TP+FSDP2 (TP=2, DP=2): 4x H100, bf16, 10 steps
+### TP+FSDP2 (TP=2, DP=4): 8x H100, bf16, 10 steps
 
 | Comparison                      | Max Loss Rel Diff | Max Grad Norm Rel Diff |
 |---------------------------------|-------------------|------------------------|
-| DDP_TP2 vs FSDP2_TP2            | 0.0033%           | 0.0197%                |
-| DDP_TP2 vs FSDP2_TP2_NORESHARD  | 0.0022%           | 0.0195%                |
+| DDP_TP2 vs FSDP2_TP2            | 0.0015%           | 0.0147%                |
+| DDP_TP2 vs FSDP2_TP2_NORESHARD  | 0.0009%           | 0.0203%                |
+| DDP_TP2 vs FSDP2_TP2_HSDP      | 0.0013%           | 0.0218%                |
 
 Run validation:
 ```bash
 python validate_fsdp2_nanotron.py --steps 10 --nproc 4              # DP-only
 python validate_fsdp2_nanotron.py --steps 10 --nproc 4 --tp 2      # TP + FSDP2
+python validate_fsdp2_nanotron.py --steps 10 --nproc 8 --tp 2 --hsdp --local-world-size 4  # TP + HSDP
 ```
 
 ---
@@ -41,7 +44,7 @@ python validate_fsdp2_nanotron.py --steps 10 --nproc 4 --tp 2      # TP + FSDP2
 
 ### `src/nanotron/parallel/data_parallel/fsdp.py`
 Core FSDP2 integration module. Key functions:
-- `_build_dp_mesh()` — builds a `DeviceMesh` for FSDP2. When TP > 1, constructs a 2D mesh `(dp, tp)` covering all world ranks (required since `DeviceMesh` creation is collective) and extracts the `"dp"` sub-mesh. When TP=1, uses a simple 1D mesh.
+- `_build_dp_mesh()` — builds a `DeviceMesh` for FSDP2. When TP > 1 (non-hybrid), constructs a 2D mesh `(dp, tp)` and extracts `"dp"`. When TP > 1 + hybrid (HSDP), constructs a 3D mesh `(replicate, shard, tp)` and extracts `("replicate", "shard")` for HSDP. When TP=1, uses a simple 1D mesh (or 2D for HSDP).
 - `apply_fsdp2()` — walks the model's `PipelineBlock`s, applies `fully_shard()` to each `pp_block` (skipping non-Module blocks like `cast_to_fp32`) and the root model.
 - `collect_tied_param_metadata()` — captures NanotronParameter tied/sharded metadata *before* FSDP2 converts them to DTensors. This is critical for TP+FSDP2 to correctly handle gradient norm computation and tied gradient sync.
 - `sync_fsdp_tied_gradients()` — manually syncs tied param gradients for FSDP2 models (needed for TP REDUCE_SCATTER mode where replicated param gradients must be summed across TP ranks).
@@ -158,6 +161,16 @@ parallelism:
   tp: 2
   dp_engine: fsdp2
   fsdp_reshard_after_forward: true
+
+# TP + HSDP (e.g., 16 GPUs: TP=2, DP=8, HSDP shards within 4-GPU "nodes")
+# With LOCAL_WORLD_SIZE=8, shard_size = 8/2 = 4 DP ranks, replicas = 8/4 = 2
+parallelism:
+  dp: 8
+  pp: 1
+  tp: 2
+  dp_engine: fsdp2
+  fsdp_reshard_after_forward: true
+  fsdp_hybrid: true
 ```
 
 ## Design Decisions
@@ -166,7 +179,7 @@ parallelism:
 
 2. **Pre-captured metadata**: Before FSDP2 wrapping, we capture tied parameter metadata (`FSDPTiedParamMetadata`) — which params are tied, their global ranks, and reduce ops. This is essential for correct gradient norm computation (avoid double-counting replicated params across TP) and tied gradient synchronization (REDUCE_SCATTER mode).
 
-3. **2D DeviceMesh for TP+FSDP**: When TP > 1, `DeviceMesh` creation is collective (all world ranks must participate). We create a 2D mesh `(dp, tp)` that all ranks agree on, then extract the `"dp"` sub-mesh for `fully_shard()`. This correctly isolates FSDP sharding to the DP dimension.
+3. **Multi-dimensional DeviceMesh for TP+FSDP**: When TP > 1, `DeviceMesh` creation is collective (all world ranks must participate). For TP + full sharding, we create a 2D mesh `(dp, tp)` and extract `"dp"`. For TP + HSDP, we create a 3D mesh `(replicate, shard, tp)` and extract `("replicate", "shard")`. This correctly isolates FSDP/HSDP sharding to the appropriate dimensions.
 
 4. **No ZeRO optimizer**: FSDP2 handles optimizer state sharding internally, so `ZeroDistributedOptimizer` is bypassed.
 
@@ -178,6 +191,5 @@ parallelism:
 
 ## Current Limitations
 
-- **TP + HSDP**: Hybrid sharding combined with TP > 1 is not yet supported (would need a 3D mesh).
 - **PP + TP + FSDP2**: Pipeline parallelism combined with TP + FSDP2 is not yet supported (each PP stage would need its own mesh coordination).
 - **CP + FSDP2**: Context parallelism combined with FSDP2 is not yet supported.

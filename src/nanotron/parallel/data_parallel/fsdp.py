@@ -148,12 +148,61 @@ def _build_dp_mesh(
         )
 
     if tp_size > 1 and hybrid:
-        raise NotImplementedError(
-            "FSDP2 hybrid sharding (HSDP) combined with TP > 1 is not yet supported."
+        # TP + HSDP: Build a global 3D mesh (replicate, shard, tp).
+        # Nanotron rank layout: rank = dp_idx * tp_size + tp_idx
+        # where dp_idx = replica_idx * shard_size + shard_idx
+        #
+        # HSDP shards within a "local group" (intra-node) and replicates across (inter-node).
+        # With TP, there are (local_world_size / tp_size) DP positions per node.
+        import os
+        local_size = int(os.environ.get("LOCAL_WORLD_SIZE", "8"))
+        shard_size = local_size // tp_size  # DP ranks per node
+
+        if shard_size < 1:
+            raise ValueError(
+                f"TP + HSDP requires LOCAL_WORLD_SIZE ({local_size}) >= tp_size ({tp_size})."
+            )
+        if dp_size % shard_size != 0:
+            log_rank(
+                f"[FSDP2] WARNING: dp_size={dp_size} not divisible by shard_size={shard_size} "
+                f"(local_size={local_size}, tp={tp_size}). Falling back to TP + full FSDP.",
+                logger=logger, level=logging.WARNING, rank=0,
+            )
+            mesh_tensor = np.arange(world_size).reshape(dp_size, tp_size).tolist()
+            mesh_2d = DeviceMesh("cuda", mesh_tensor, mesh_dim_names=("dp", "tp"))
+            return mesh_2d["dp"]
+
+        num_replicas = dp_size // shard_size
+
+        if num_replicas <= 1:
+            log_rank(
+                f"[FSDP2] WARNING: Only {num_replicas} replica(s) for HSDP — degenerates to full sharding. "
+                f"(dp={dp_size}, shard_size={shard_size}). Falling back to TP + full FSDP.",
+                logger=logger, level=logging.WARNING, rank=0,
+            )
+            mesh_tensor = np.arange(world_size).reshape(dp_size, tp_size).tolist()
+            mesh_2d = DeviceMesh("cuda", mesh_tensor, mesh_dim_names=("dp", "tp"))
+            return mesh_2d["dp"]
+
+        # 3D mesh: (num_replicas, shard_size, tp_size)
+        # mesh[rep][shard][tp] = (rep * shard_size + shard) * tp_size + tp
+        mesh_tensor = np.arange(world_size).reshape(num_replicas, shard_size, tp_size).tolist()
+        mesh_3d = DeviceMesh(
+            "cuda", mesh_tensor,
+            mesh_dim_names=("replicate", "shard", "tp"),
         )
+        hsdp_mesh = mesh_3d["replicate", "shard"]
+
+        log_rank(
+            f"[FSDP2] Built 3D (replicate, shard, tp) mesh: "
+            f"replicas={num_replicas}, shard={shard_size}, tp={tp_size}, "
+            f"mesh={mesh_tensor} -> using ('replicate', 'shard') sub-mesh for HSDP+TP",
+            logger=logger, level=logging.INFO, rank=0,
+        )
+        return hsdp_mesh
 
     if tp_size > 1:
-        # TP > 1: Build a global 2D mesh (dp, tp) that ALL ranks agree on.
+        # TP > 1 (non-hybrid): Build a global 2D mesh (dp, tp) that ALL ranks agree on.
         # DeviceMesh creation is collective (uses dist.new_group internally),
         # so all ranks must provide the same mesh tensor.
         #

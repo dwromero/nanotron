@@ -159,6 +159,7 @@ def run_training(
     nproc: int,
     label: str,
     run_dir: str,
+    extra_env: dict[str, str] | None = None,
 ) -> list[dict]:
     """Write config and run torchrun, returning parsed per-step metrics."""
     config_path = os.path.join(run_dir, f"config_{label}.yaml")
@@ -182,9 +183,13 @@ def run_training(
 
     env = os.environ.copy()
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
     env["WANDB_MODE"] = "disabled"
     env["NANOTRON_LOG_PRECISION"] = "high"
     env["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+    if extra_env:
+        env.update(extra_env)
+        print(f"Extra env: {extra_env}")
 
     result = subprocess.run(
         cmd,
@@ -335,6 +340,10 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
     parser.add_argument("--tp", type=int, default=0,
                         help="If > 0, only run TP+FSDP2 validation with this TP degree (requires nproc > tp)")
+    parser.add_argument("--hsdp", action="store_true",
+                        help="Also test HSDP (hybrid sharding) variants. With --tp, tests TP+HSDP.")
+    parser.add_argument("--local-world-size", type=int, default=0,
+                        help="Override LOCAL_WORLD_SIZE for HSDP testing (simulate multi-node)")
     args = parser.parse_args()
 
     # Use a persistent directory under nanotron/ so logs survive compute-node cleanup
@@ -379,6 +388,33 @@ def main():
         fsdp_tp_nr_metrics = run_training(fsdp_tp_nr_yaml, args.nproc, f"FSDP2_TP{tp}_NORESHARD", run_dir)
 
         all_passed &= compare_results(f"DDP_TP{tp}", f"FSDP2_TP{tp}_NORESHARD", ddp_tp_metrics, fsdp_tp_nr_metrics)
+
+        # HSDP + TP (hybrid sharding with tensor parallelism)
+        if args.hsdp:
+            dp = args.nproc // tp
+            # Determine LOCAL_WORLD_SIZE for HSDP
+            local_ws = args.local_world_size if args.local_world_size > 0 else int(os.environ.get("LOCAL_WORLD_SIZE", str(args.nproc)))
+            shard_size = local_ws // tp
+            num_replicas = dp // shard_size if shard_size > 0 else 0
+
+            if shard_size < 1 or dp % shard_size != 0 or num_replicas <= 1:
+                print(f"\nWARNING: Skipping TP+HSDP test — need meaningful HSDP topology.")
+                print(f"  dp={dp}, tp={tp}, local_world_size={local_ws}, shard_size={shard_size}, replicas={num_replicas}")
+                print(f"  Need: shard_size >= 1, dp % shard_size == 0, replicas > 1")
+                print(f"  Try more GPUs or a different --local-world-size.")
+            else:
+                hsdp_env = {"LOCAL_WORLD_SIZE": str(local_ws)}
+
+                fsdp_tp_hsdp_yaml = make_config_yaml(
+                    dp_engine="fsdp2", fsdp_reshard=True, fsdp_hybrid=True, tp=tp, **common,
+                )
+                fsdp_tp_hsdp_metrics = run_training(
+                    fsdp_tp_hsdp_yaml, args.nproc, f"FSDP2_TP{tp}_HSDP", run_dir,
+                    extra_env=hsdp_env,
+                )
+                all_passed &= compare_results(
+                    f"DDP_TP{tp}", f"FSDP2_TP{tp}_HSDP", ddp_tp_metrics, fsdp_tp_hsdp_metrics,
+                )
 
     else:
         # =====================================================================
