@@ -170,3 +170,4 @@ datatrove/
 eval_results/
 tb_logs/
 .nanoset_cache/
+validate_runs/
