@@ -41,6 +41,7 @@ rm -f "$SENTINEL"
 MODEL_SIZE=""
 STRATEGY=""
 TP_SIZE=1
+TP_EXPLICIT=0
 PP_SIZE=1
 CP_SIZE=1
 SEQ_LEN_OVERRIDE=""
@@ -50,7 +51,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --model-size) MODEL_SIZE="$2"; shift 2 ;;
         --strategy)   STRATEGY="$2"; shift 2 ;;
-        --tp-size)    TP_SIZE="$2"; shift 2 ;;
+        --tp-size)    TP_SIZE="$2"; TP_EXPLICIT=1; shift 2 ;;
         --pp-size)    PP_SIZE="$2"; shift 2 ;;
         --cp-size)    CP_SIZE="$2"; shift 2 ;;
         --seq-len)    SEQ_LEN_OVERRIDE="$2"; shift 2 ;;
@@ -196,8 +197,10 @@ case "$MODEL_SIZE" in
         RMS_NORM_EPS="1.0e-06"
         ROPE_THETA=50000.0
         DDP_BUCKET_CAP_MB=50
-        # Force TP=2 to match production recipe (override any CLI --tp-size)
-        TP_SIZE=2
+        # Default TP=2 for production recipe; respect explicit --tp-size override
+        if [[ $TP_EXPLICIT -eq 0 ]]; then
+            TP_SIZE=2
+        fi
         ;;
     *)
         echo "ERROR: Unknown model size '$MODEL_SIZE'. Must be 1b, 3b, 8b, or smol3b."
